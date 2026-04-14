@@ -88,7 +88,8 @@ uint8_t zmk_split_esb_display_get_wpm(void) {
 static int try_read_display_packet(void) {
     size_t min_size = sizeof(struct esb_display_prefix)
                     + sizeof(struct esb_display_state)
-                    + sizeof(struct esb_msg_postfix);
+                    + sizeof(struct esb_msg_postfix)
+                    + sizeof(struct esb_msg_meta);
 
     if (ring_buf_size_get(&chosen_rx_buf) < min_size) {
         return -EAGAIN;
@@ -111,7 +112,7 @@ static int try_read_display_packet(void) {
     struct esb_display_envelope env;
     size_t env_size = sizeof(env.prefix) + prefix.payload_size;
 
-    if (ring_buf_size_get(&chosen_rx_buf) < env_size + sizeof(struct esb_msg_postfix)) {
+    if (ring_buf_size_get(&chosen_rx_buf) < env_size + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta)) {
         return -EAGAIN;
     }
 
@@ -126,6 +127,14 @@ static int try_read_display_packet(void) {
     read = ring_buf_get(&chosen_rx_buf, (uint8_t *)&postfix, sizeof(postfix));
     if (read != sizeof(postfix)) {
         LOG_WRN("display packet: postfix short read");
+        ring_buf_reset(&chosen_rx_buf);
+        return -EINVAL;
+    }
+    
+    struct esb_msg_meta meta;
+    read = ring_buf_get(&chosen_rx_buf, (uint8_t *)&meta, sizeof(meta));
+    if (read != sizeof(meta)) {
+        LOG_WRN("display packet: meta short read");
         ring_buf_reset(&chosen_rx_buf);
         return -EINVAL;
     }
@@ -308,7 +317,8 @@ SYS_INIT(zmk_split_esb_peripheral_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY
 static void process_tx_cb(void) {
     size_t min_packet_size = sizeof(struct esb_display_prefix)
                            + sizeof(struct esb_display_state)
-                           + sizeof(struct esb_msg_postfix);
+                           + sizeof(struct esb_msg_postfix)
+                           + sizeof(struct esb_msg_meta);
 
     while (ring_buf_size_get(&chosen_rx_buf) >= min_packet_size) {
 
