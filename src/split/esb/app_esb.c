@@ -265,11 +265,18 @@ static int esb_initialize(app_esb_mode_t mode) {
     config.protocol = ESB_PROTOCOL_ESB_DPL;
     config.retransmit_delay = CONFIG_ZMK_SPLIT_ESB_PROTO_TX_RETRANSMIT_DELAY;
     config.retransmit_count = CONFIG_ZMK_SPLIT_ESB_PROTO_TX_RETRANSMIT_COUNT;
-    config.bitrate = ESB_BITRATE_2MBPS;
     config.event_handler = event_handler;
     config.mode = (mode == APP_ESB_MODE_PTX) ? ESB_MODE_PTX : ESB_MODE_PRX;
     config.tx_mode = ESB_TXMODE_MANUAL_START;
     config.selective_auto_ack = true;
+
+    // RF TUNING (was: 2 Mbps, 0 dBm)
+
+    // 1 Mbps should give slightly better performance than 2 Mbps
+    config.bitrate = ESB_BITRATE_1MBPS;
+
+    // Boost power to 8 should help with reliability
+    config.tx_output_power = 8;
 
     err = esb_init(&config);
 
@@ -290,6 +297,12 @@ static int esb_initialize(app_esb_mode_t mode) {
     err = esb_set_prefixes(esb_addr_prefix, ARRAY_SIZE(esb_addr_prefix));
     if (err) {
         return err;
+    }
+
+    // trying to gurantee the channel is above any wifi channels
+    err = esb_set_rf_channel(78);
+    if (err) {
+        LOG_WRN("Failed to set RF channel (%d)", err);
     }
 
     NVIC_SetPriority(RADIO_IRQn, 0);
