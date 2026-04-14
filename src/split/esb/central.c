@@ -27,6 +27,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 #include <zmk/hid_indicators_types.h>
 #include <zmk/physical_layouts.h>
 
+#include <zmk/events/layer_state_changed.h>
+#include <zmk/events/wpm_state_changed.h>
+#include <zmk/keymap.h>
+
 #include "app_esb.h"
 #include "common.h"
 
@@ -63,6 +67,68 @@ static void begin_tx(void) {
     zmk_split_esb_async_tx(&async_state);
 }
 
+
+// display logic
+static uint8_t current_layer_index = 0;
+static uint8_t current_wpm = 0;
+
+static void send_display_state(void) {
+    int ret = k_sem_take(&esb_send_cmd_sem, K_FOREVER);
+    if (ret) {
+        return;
+    }
+
+    size_t payload_size = sizeof(struct esb_display_state);
+
+    if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + payload_size) {
+        LOG_WRN("no room for display state in tx buf");
+        k_sem_give(&esb_send_cmd_sem);
+        return;
+    }
+
+    struct esb_display_envelope env = {
+        .prefix = {
+            .magic_prefix = ZMK_SPLIT_ESB_DISPLAY_MAGIC_PREFIX,
+            .payload_size = payload_size,
+        },
+        .payload = {
+            .layer_index = current_layer_index,
+            .wpm = current_wpm,
+        },
+    };
+
+    size_t pfx_len = sizeof(env.prefix) + payload_size;
+    size_t put = ring_buf_put(&tx_buf, (uint8_t *)&env, pfx_len);
+    if (put != pfx_len) {
+        LOG_WRN("display state: partial write (%d vs %d)", put, pfx_len);
+    }
+
+    struct esb_msg_postfix postfix = {.crc = crc32_ieee((void *)&env, pfx_len)};
+    put = ring_buf_put(&tx_buf, (uint8_t *)&postfix, sizeof(postfix));
+    if (put != sizeof(postfix)) {
+        LOG_WRN("display state: postfix write failed");
+    }
+
+    if (++cmd_message_id == 0) {
+        cmd_message_id = 1;
+    }
+    struct esb_msg_meta meta = {.message_id = cmd_message_id, .max_retry = 0};
+    put = ring_buf_put(&tx_buf, (uint8_t *)&meta, sizeof(meta));
+    if (put != sizeof(meta)) {
+        LOG_WRN("display state: meta write failed");
+    }
+
+    begin_tx();
+    k_sem_give(&esb_send_cmd_sem);
+}
+
+static void send_display_state_work_cb(struct k_work *work) {
+    send_display_state();
+}
+static K_WORK_DEFINE(send_display_state_work, send_display_state_work_cb);
+
+
+// existing
 static ssize_t get_payload_data_size(const struct zmk_split_transport_central_command *cmd) {
     switch (cmd->type) {
     case ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_POLL_EVENTS:
@@ -231,3 +297,28 @@ static void publish_events_work(struct k_work *work) {
         }
     }
 }
+
+
+// display listeners
+static int on_layer_state_changed(const zmk_event_t *eh) {
+    current_layer_index = zmk_keymap_highest_layer_active();
+
+    k_work_submit(&send_display_state_work);
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+static int on_wpm_state_changed(const zmk_event_t *eh) {
+    struct zmk_wpm_state_changed *wpm_ev = as_zmk_wpm_state_changed(eh);
+    if (wpm_ev) {
+        current_wpm = (wpm_ev->state > 255) ? 255 : (uint8_t)wpm_ev->state;
+    }
+
+    k_work_submit(&send_display_state_work);
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(esb_central_display_layer, on_layer_state_changed);
+ZMK_SUBSCRIPTION(esb_central_display_layer, zmk_layer_state_changed);
+
+ZMK_LISTENER(esb_central_display_wpm, on_wpm_state_changed);
+ZMK_SUBSCRIPTION(esb_central_display_wpm, zmk_wpm_state_changed);

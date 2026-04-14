@@ -13,6 +13,7 @@
 #include "app_esb.h"
 
 #define ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX "ZmKe"
+#define ZMK_SPLIT_ESB_DISPLAY_MAGIC_PREFIX  "ZmKd"
 
 struct esb_msg_prefix {
     uint8_t magic_prefix[sizeof(ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX) - 1];
@@ -49,6 +50,25 @@ struct esb_msg_meta {
 } __packed;
 
 #define ESB_MSG_EXTRA_SIZE (sizeof(struct esb_msg_prefix) + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta))
+
+struct esb_display_state {
+    uint8_t layer_index;
+    uint8_t wpm;
+} __packed;
+
+struct esb_display_prefix {
+    uint8_t magic_prefix[sizeof(ZMK_SPLIT_ESB_DISPLAY_MAGIC_PREFIX) - 1];
+    uint8_t payload_size;
+} __packed;
+
+struct esb_display_envelope {
+    struct esb_display_prefix prefix;
+    struct esb_display_state payload;
+} __packed;
+
+uint8_t zmk_split_esb_display_get_layer(void);
+
+uint8_t zmk_split_esb_display_get_wpm(void);
 
 typedef void (*zmk_split_esb_process_tx_callback_t)(void);
 
