@@ -317,8 +317,8 @@ static int on_wpm_state_changed(const zmk_event_t *eh) {
     return ZMK_EV_EVENT_BUBBLE;
 }
 
-ZMK_LISTENER(esb_central_display_layer, on_layer_state_changed);
-ZMK_SUBSCRIPTION(esb_central_display_layer, zmk_layer_state_changed);
+// ZMK_LISTENER(esb_central_display_layer, on_layer_state_changed);
+// ZMK_SUBSCRIPTION(esb_central_display_layer, zmk_layer_state_changed);
 
-ZMK_LISTENER(esb_central_display_wpm, on_wpm_state_changed);
-ZMK_SUBSCRIPTION(esb_central_display_wpm, zmk_wpm_state_changed);
+// ZMK_LISTENER(esb_central_display_wpm, on_wpm_state_changed);
+// ZMK_SUBSCRIPTION(esb_central_display_wpm, zmk_wpm_state_changed);
