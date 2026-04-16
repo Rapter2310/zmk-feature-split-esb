@@ -73,8 +73,8 @@ static void begin_tx(void) {
 
 
 // display logic
-static uint8_t current_layer_index = 0;
-static uint8_t current_wpm = 0;
+static volatile uint8_t current_layer_index = 0;
+static volatile uint8_t current_wpm = 0;
 
 static void send_display_state(void) {
     int ret = k_sem_take(&esb_send_cmd_sem, K_FOREVER);
@@ -116,10 +116,7 @@ static void send_display_state(void) {
         LOG_WRN("display state: postfix write failed");
     }
 
-    if (++cmd_message_id == 0) {
-        cmd_message_id = 1;
-    }
-    struct esb_msg_meta meta = {.message_id = cmd_message_id, .max_retry = 0};
+    struct esb_msg_meta meta = {.message_id = 0, .max_retry = 0};
     put = ring_buf_put(&tx_buf, (uint8_t *)&meta, sizeof(meta));
     if (put != sizeof(meta)) {
         LOG_WRN("display state: meta write failed");
@@ -139,11 +136,13 @@ static K_WORK_DEFINE(send_display_state_work, send_display_state_work_cb);
 // periodic resend so both peripherals eventually receive display state
 #define DISPLAY_RESEND_INTERVAL_MS 1000
 
+static void display_resend_timer_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(display_resend_work, display_resend_timer_cb);
+
 static void display_resend_timer_cb(struct k_work *work) {
     send_display_state();
     k_work_reschedule(&display_resend_work, K_MSEC(DISPLAY_RESEND_INTERVAL_MS));
 }
-static K_WORK_DELAYABLE_DEFINE(display_resend_work, display_resend_timer_cb);
 
 
 // existing
