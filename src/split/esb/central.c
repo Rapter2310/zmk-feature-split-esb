@@ -36,7 +36,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 #include "common.h"
 
 #define RX_BUFFER_SIZE                                                                             \
-    ((sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix)) *                        \
+    ((sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix)) * \
      CONFIG_ZMK_SPLIT_ESB_EVENT_BUFFER_ITEMS)
 #define DISPLAY_TX_BUFFER_ITEMS 4
 #define TX_BUFFER_SIZE                                                                             \
@@ -78,15 +78,19 @@ static volatile uint8_t last_sent_layer = 255;
 static volatile uint8_t last_sent_wpm = 255;
 
 static int send_display_state(void) {
+    LOG_DBG("send_display_state: layer=%d wpm=%d", current_layer_index, current_wpm);
+
     int ret = k_sem_take(&esb_send_cmd_sem, K_FOREVER);
     if (ret) {
+        LOG_WRN("send_display_state: sem take failed");
         return -EAGAIN;
     }
 
     size_t payload_size = sizeof(struct esb_display_state);
 
     if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + payload_size) {
-        LOG_WRN("no room for display state in tx buf");
+        LOG_WRN("no room for display state in tx buf (space=%d need=%d)",
+                ring_buf_space_get(&tx_buf), ESB_MSG_EXTRA_SIZE + payload_size);
         k_sem_give(&esb_send_cmd_sem);
         return -ENOSPC;
     }
@@ -127,6 +131,7 @@ static int send_display_state(void) {
 
     begin_tx();
     k_sem_give(&esb_send_cmd_sem);
+    LOG_DBG("send_display_state: queued OK (tx_buf used=%d)", ring_buf_size_get(&tx_buf));
     return 0;
 }
 
@@ -135,6 +140,8 @@ static K_WORK_DELAYABLE_DEFINE(display_sync_work, display_sync_timer_cb);
 
 static void display_sync_timer_cb(struct k_work *work) {
     if (current_layer_index != last_sent_layer || current_wpm != last_sent_wpm) {
+        LOG_DBG("display_sync: dirty (layer %d->%d, wpm %d->%d)",
+                last_sent_layer, current_layer_index, last_sent_wpm, current_wpm);
         if (send_display_state() == 0) {
             last_sent_layer = current_layer_index;
             last_sent_wpm = current_wpm;
@@ -161,6 +168,8 @@ static ssize_t get_payload_data_size(const struct zmk_split_transport_central_co
 
 static int split_central_esb_send_command(uint8_t source,
                                           struct zmk_split_transport_central_command cmd) {
+
+    LOG_DBG("send_command: type=%d source=%d", cmd.type, source);
 
     ssize_t data_size = get_payload_data_size(&cmd);
     if (data_size < 0) {
@@ -280,6 +289,7 @@ static void notify_status_work_cb(struct k_work *_work) { notify_transport_statu
 static K_WORK_DEFINE(notify_status_work, notify_status_work_cb);
 
 static int zmk_split_esb_central_init(void) {
+    LOG_INF("ESB central init starting");
     int ret = zmk_split_esb_init(APP_ESB_MODE_PRX, zmk_split_esb_on_prx_esb_callback);
     if (ret) {
         LOG_ERR("zmk_split_esb_init failed (err %d)", ret);
@@ -288,6 +298,7 @@ static int zmk_split_esb_central_init(void) {
     k_work_submit(&notify_status_work);
     
     k_work_schedule(&display_sync_work, K_MSEC(250));
+    LOG_INF("ESB central init done, display sync scheduled");
     
     return 0;
 }
@@ -301,6 +312,7 @@ static void publish_events_work(struct k_work *work) {
             zmk_split_esb_get_item(&rx_buf, (uint8_t *)&env, sizeof(struct esb_event_envelope));
         switch (item_err) {
         case 0:
+            LOG_DBG("rx event: source=%d type=%d", env.payload.source, env.payload.event.type);
             zmk_split_transport_central_peripheral_event_handler(&esb_central, env.payload.source,
                                                                  env.payload.event);
             break;
@@ -315,7 +327,9 @@ static void publish_events_work(struct k_work *work) {
 
 // display listeners
 static int on_layer_state_changed(const zmk_event_t *eh) {
+    uint8_t prev = current_layer_index;
     current_layer_index = zmk_keymap_highest_layer_active();
+    LOG_DBG("layer changed: %d -> %d", prev, current_layer_index);
     return ZMK_EV_EVENT_BUBBLE;
 }
 
@@ -323,6 +337,9 @@ static int on_wpm_state_changed(const zmk_event_t *eh) {
     struct zmk_wpm_state_changed *wpm_ev = as_zmk_wpm_state_changed(eh);
     if (wpm_ev) {
         current_wpm = (wpm_ev->state > 255) ? 255 : (uint8_t)wpm_ev->state;
+        LOG_DBG("wpm changed: %d", current_wpm);
+    } else {
+        LOG_WRN("wpm event was NULL");
     }
     return ZMK_EV_EVENT_BUBBLE;
 }
