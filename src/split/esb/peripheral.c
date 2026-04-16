@@ -10,6 +10,7 @@
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/crc.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/irq.h>
 
 #include <zephyr/logging/log.h>
 
@@ -68,10 +69,6 @@ static void begin_tx(void) {
     zmk_split_esb_async_tx(&async_state);
 }
 
-void zmk_split_esb_on_ptx_esb_callback(app_esb_event_t *event) {
-    zmk_split_esb_cb(event, &async_state);
-}
-
 
 // new display logic
 static uint8_t display_layer_index = 0;
@@ -85,76 +82,44 @@ uint8_t zmk_split_esb_display_get_wpm(void) {
     return display_wpm;
 }
 
-static int try_read_display_packet(void) {
-    size_t min_size = sizeof(struct esb_display_prefix)
-                    + sizeof(struct esb_display_state)
-                    + sizeof(struct esb_msg_postfix)
-                    + sizeof(struct esb_msg_meta);
+void zmk_split_esb_on_ptx_esb_callback(app_esb_event_t *event) {
+    if (event->evt_type == APP_ESB_EVT_RX &&
+        event->data_length >= sizeof(struct esb_display_prefix)) {
+        struct esb_display_prefix *pfx = (struct esb_display_prefix *)event->buf;
+        if (memcmp(pfx->magic_prefix, ZMK_SPLIT_ESB_DISPLAY_MAGIC_PREFIX,
+                   sizeof(pfx->magic_prefix)) == 0) {
+            size_t env_size = sizeof(struct esb_display_prefix) + pfx->payload_size;
+            size_t needed = env_size + sizeof(struct esb_msg_postfix);
 
-    if (ring_buf_size_get(&chosen_rx_buf) < min_size) {
-        return -EAGAIN;
+            if (event->data_length < needed) {
+                LOG_WRN("Display packet too short (%d < %d)", event->data_length, needed);
+                return;
+            }
+
+            if (pfx->payload_size != sizeof(struct esb_display_state)) {
+                LOG_WRN("Display payload size mismatch (%d != %d)",
+                        pfx->payload_size, sizeof(struct esb_display_state));
+                return;
+            }
+
+            struct esb_display_envelope *env = (struct esb_display_envelope *)event->buf;
+            struct esb_msg_postfix *post = (struct esb_msg_postfix *)(event->buf + env_size);
+            uint32_t crc = crc32_ieee(event->buf, env_size);
+
+            if (crc != post->crc) {
+                LOG_WRN("Display packet CRC mismatch (%08x != %08x)", crc, post->crc);
+                return;
+            }
+
+            display_layer_index = env->payload.layer_index;
+            display_wpm = env->payload.wpm;
+            return;
+        }
     }
-
-    struct esb_display_prefix prefix;
-    ring_buf_peek(&chosen_rx_buf, (uint8_t *)&prefix, sizeof(prefix));
-
-    if (memcmp(prefix.magic_prefix, ZMK_SPLIT_ESB_DISPLAY_MAGIC_PREFIX,
-               sizeof(prefix.magic_prefix)) != 0) {
-        return 1;
-    }
-
-    if (prefix.payload_size != sizeof(struct esb_display_state)) {
-        LOG_WRN("display packet has weird payload size: %d", prefix.payload_size);
-        ring_buf_reset(&chosen_rx_buf);
-        return -EINVAL;
-    }
-
-    struct esb_display_envelope env;
-    size_t env_size = sizeof(env.prefix) + prefix.payload_size;
-
-    if (ring_buf_size_get(&chosen_rx_buf) < env_size + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta)) {
-        return -EAGAIN;
-    }
-
-    uint32_t read = ring_buf_get(&chosen_rx_buf, (uint8_t *)&env, env_size);
-    if (read != env_size) {
-        LOG_WRN("display packet: short read (%d vs %d)", read, env_size);
-        ring_buf_reset(&chosen_rx_buf);
-        return -EINVAL;
-    }
-
-    struct esb_msg_postfix postfix;
-    read = ring_buf_get(&chosen_rx_buf, (uint8_t *)&postfix, sizeof(postfix));
-    if (read != sizeof(postfix)) {
-        LOG_WRN("display packet: postfix short read");
-        ring_buf_reset(&chosen_rx_buf);
-        return -EINVAL;
-    }
-    
-    struct esb_msg_meta meta;
-    read = ring_buf_get(&chosen_rx_buf, (uint8_t *)&meta, sizeof(meta));
-    if (read != sizeof(meta)) {
-        LOG_WRN("display packet: meta short read");
-        ring_buf_reset(&chosen_rx_buf);
-        return -EINVAL;
-    }
-
-    uint32_t crc = crc32_ieee((uint8_t *)&env, env_size);
-    if (crc != postfix.crc) {
-        LOG_WRN("display packet: crc mismatch (%08x vs %08x)", crc, postfix.crc);
-        ring_buf_reset(&chosen_rx_buf);
-        return -EINVAL;
-    }
-
-    display_layer_index = env.payload.layer_index;
-    display_wpm = env.payload.wpm;
-    // LOG_DBG("display state rx: layer=%d wpm=%d", display_layer_index, display_wpm);
-
-    return 0;
+    zmk_split_esb_cb(event, &async_state);
 }
 
 
-// existing
 static ssize_t get_payload_data_size(const struct zmk_split_transport_peripheral_event *evt) {
     switch (evt->type) {
     case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_INPUT_EVENT:
@@ -227,6 +192,9 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
     size_t pfx_len = sizeof(env.prefix) + payload_size;
     // LOG_HEXDUMP_DBG(&env, pfx_len, "Payload");
 
+    // lock IRQs so the ESB TX callback can't read a half-written message
+    unsigned int irq_key = irq_lock();
+
     size_t put = ring_buf_put(&chosen_tx_buf, (uint8_t *)&env, pfx_len);
     if (put != pfx_len) {
         LOG_WRN("Failed to put the whole message (%d vs %d)", put, pfx_len);
@@ -251,6 +219,8 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
         LOG_WRN("Failed to put the meta (%d vs %d)", put, sizeof(meta));
     }
     // LOG_HEXDUMP_DBG(&meta, sizeof(meta), "meta");
+
+    irq_unlock(irq_key);
 
     begin_tx();
 
@@ -315,27 +285,7 @@ SYS_INIT(zmk_split_esb_peripheral_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY
 
 // modified for display logic
 static void process_tx_cb(void) {
-    size_t min_packet_size = sizeof(struct esb_display_prefix)
-                           + sizeof(struct esb_display_state)
-                           + sizeof(struct esb_msg_postfix)
-                           + sizeof(struct esb_msg_meta);
-
-    while (ring_buf_size_get(&chosen_rx_buf) >= min_packet_size) {
-
-        int disp_ret = try_read_display_packet();
-
-        if (disp_ret == 0) {
-            continue;
-        } else if (disp_ret == -EAGAIN) {
-            return;
-        } else if (disp_ret == -EINVAL) {
-            return;
-        }
-
-        if (ring_buf_size_get(&chosen_rx_buf) <= ESB_MSG_EXTRA_SIZE) {
-            return;
-        }
-
+    while (ring_buf_size_get(&chosen_rx_buf) > ESB_MSG_EXTRA_SIZE) {
         struct esb_command_envelope env;
         int item_err = zmk_split_esb_get_item(&chosen_rx_buf, (uint8_t *)&env,
                                                 sizeof(struct esb_command_envelope));

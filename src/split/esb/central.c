@@ -10,6 +10,7 @@
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/crc.h>
 #include <zephyr/sys/ring_buffer.h>
+#include <zephyr/irq.h>
 
 #include <zephyr/logging/log.h>
 
@@ -37,9 +38,12 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 #define RX_BUFFER_SIZE                                                                             \
     ((sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix)) *                        \
      CONFIG_ZMK_SPLIT_ESB_EVENT_BUFFER_ITEMS)
+#define DISPLAY_TX_BUFFER_ITEMS 4
 #define TX_BUFFER_SIZE                                                                             \
-    ((sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix)) *                      \
-     CONFIG_ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS)
+    (((sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta)) * \
+     CONFIG_ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS) +                                                     \
+    ((sizeof(struct esb_display_envelope) + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta)) * \
+     DISPLAY_TX_BUFFER_ITEMS))
 
 RING_BUF_DECLARE(rx_buf, RX_BUFFER_SIZE);
 RING_BUF_DECLARE(tx_buf, TX_BUFFER_SIZE);
@@ -98,6 +102,9 @@ static void send_display_state(void) {
     };
 
     size_t pfx_len = sizeof(env.prefix) + payload_size;
+
+    unsigned int irq_key = irq_lock();
+
     size_t put = ring_buf_put(&tx_buf, (uint8_t *)&env, pfx_len);
     if (put != pfx_len) {
         LOG_WRN("display state: partial write (%d vs %d)", put, pfx_len);
@@ -118,6 +125,8 @@ static void send_display_state(void) {
         LOG_WRN("display state: meta write failed");
     }
 
+    irq_unlock(irq_key);
+
     begin_tx();
     k_sem_give(&esb_send_cmd_sem);
 }
@@ -126,6 +135,15 @@ static void send_display_state_work_cb(struct k_work *work) {
     send_display_state();
 }
 static K_WORK_DEFINE(send_display_state_work, send_display_state_work_cb);
+
+// periodic resend so both peripherals eventually receive display state
+#define DISPLAY_RESEND_INTERVAL_MS 1000
+
+static void display_resend_timer_cb(struct k_work *work) {
+    send_display_state();
+    k_work_reschedule(&display_resend_work, K_MSEC(DISPLAY_RESEND_INTERVAL_MS));
+}
+static K_WORK_DELAYABLE_DEFINE(display_resend_work, display_resend_timer_cb);
 
 
 // existing
@@ -187,6 +205,8 @@ static int split_central_esb_send_command(uint8_t source,
     size_t pfx_len = sizeof(env.prefix) + payload_size;
     // LOG_HEXDUMP_DBG(&env, pfx_len, "Payload");
 
+    unsigned int irq_key = irq_lock();
+
     size_t put = ring_buf_put(&tx_buf, (uint8_t *)&env, pfx_len);
     if (put != pfx_len) {
         LOG_WRN("Failed to put the whole message (%d vs %d)", put, pfx_len);
@@ -208,6 +228,8 @@ static int split_central_esb_send_command(uint8_t source,
     if (put != sizeof(meta)) {
         LOG_WRN("Failed to put the meta (%d vs %d)", put, sizeof(meta));
     }
+
+    irq_unlock(irq_key);
 
     begin_tx();
 
@@ -274,6 +296,7 @@ static int zmk_split_esb_central_init(void) {
         return ret;
     }
     k_work_submit(&notify_status_work);
+    k_work_schedule(&display_resend_work, K_MSEC(DISPLAY_RESEND_INTERVAL_MS));
     return 0;
 }
 
@@ -317,8 +340,8 @@ static int on_wpm_state_changed(const zmk_event_t *eh) {
     return ZMK_EV_EVENT_BUBBLE;
 }
 
-// ZMK_LISTENER(esb_central_display_layer, on_layer_state_changed);
-// ZMK_SUBSCRIPTION(esb_central_display_layer, zmk_layer_state_changed);
+ZMK_LISTENER(esb_central_display_layer, on_layer_state_changed);
+ZMK_SUBSCRIPTION(esb_central_display_layer, zmk_layer_state_changed);
 
-// ZMK_LISTENER(esb_central_display_wpm, on_wpm_state_changed);
-// ZMK_SUBSCRIPTION(esb_central_display_wpm, zmk_wpm_state_changed);
+ZMK_LISTENER(esb_central_display_wpm, on_wpm_state_changed);
+ZMK_SUBSCRIPTION(esb_central_display_wpm, zmk_wpm_state_changed);
