@@ -71,15 +71,16 @@ static void begin_tx(void) {
     zmk_split_esb_async_tx(&async_state);
 }
 
-
 // display logic
 static volatile uint8_t current_layer_index = 0;
 static volatile uint8_t current_wpm = 0;
+static volatile uint8_t last_sent_layer = 255;
+static volatile uint8_t last_sent_wpm = 255;
 
-static void send_display_state(void) {
+static int send_display_state(void) {
     int ret = k_sem_take(&esb_send_cmd_sem, K_FOREVER);
     if (ret) {
-        return;
+        return -EAGAIN;
     }
 
     size_t payload_size = sizeof(struct esb_display_state);
@@ -87,7 +88,7 @@ static void send_display_state(void) {
     if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + payload_size) {
         LOG_WRN("no room for display state in tx buf");
         k_sem_give(&esb_send_cmd_sem);
-        return;
+        return -ENOSPC;
     }
 
     struct esb_display_envelope env = {
@@ -126,24 +127,21 @@ static void send_display_state(void) {
 
     begin_tx();
     k_sem_give(&esb_send_cmd_sem);
+    return 0;
 }
 
-static void send_display_state_work_cb(struct k_work *work) {
-    send_display_state();
+static void display_sync_timer_cb(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(display_sync_work, display_sync_timer_cb);
+
+static void display_sync_timer_cb(struct k_work *work) {
+    if (current_layer_index != last_sent_layer || current_wpm != last_sent_wpm) {
+        if (send_display_state() == 0) {
+            last_sent_layer = current_layer_index;
+            last_sent_wpm = current_wpm;
+        }
+    }
+    k_work_reschedule(&display_sync_work, K_MSEC(250));
 }
-static K_WORK_DEFINE(send_display_state_work, send_display_state_work_cb);
-
-// periodic resend so both peripherals eventually receive display state
-#define DISPLAY_RESEND_INTERVAL_MS 1000
-
-static void display_resend_timer_cb(struct k_work *work);
-static K_WORK_DELAYABLE_DEFINE(display_resend_work, display_resend_timer_cb);
-
-static void display_resend_timer_cb(struct k_work *work) {
-    send_display_state();
-    k_work_reschedule(&display_resend_work, K_MSEC(DISPLAY_RESEND_INTERVAL_MS));
-}
-
 
 // existing
 static ssize_t get_payload_data_size(const struct zmk_split_transport_central_command *cmd) {
@@ -170,17 +168,12 @@ static int split_central_esb_send_command(uint8_t source,
         return data_size;
     }
 
-    // lock it for a safe result from ring_buf_space_get()
-    // NOTE: esb_send_cmd_sem is safe:
-    // - Called from application thread, not ISR
-    // - begin_tx() releases semaphore before returning
     int ret = k_sem_take(&esb_send_cmd_sem, K_FOREVER);
     if (ret) {
         LOG_WRN("Shouldn't be called FOREVER");
         return 0;
     }
 
-    // Data + type + source
     size_t payload_size =
         data_size + sizeof(source) + sizeof(enum zmk_split_transport_central_command_type);
 
@@ -202,7 +195,6 @@ static int split_central_esb_send_command(uint8_t source,
                                         }};
 
     size_t pfx_len = sizeof(env.prefix) + payload_size;
-    // LOG_HEXDUMP_DBG(&env, pfx_len, "Payload");
 
     unsigned int irq_key = irq_lock();
 
@@ -242,7 +234,6 @@ void zmk_split_esb_on_prx_esb_callback(app_esb_event_t *event) {
 
 static int split_central_esb_get_available_source_ids(uint8_t *sources) {
     sources[0] = 0;
-
     return 1;
 }
 
@@ -295,7 +286,9 @@ static int zmk_split_esb_central_init(void) {
         return ret;
     }
     k_work_submit(&notify_status_work);
-    k_work_schedule(&display_resend_work, K_MSEC(DISPLAY_RESEND_INTERVAL_MS));
+    
+    k_work_schedule(&display_sync_work, K_MSEC(250));
+    
     return 0;
 }
 
@@ -320,12 +313,9 @@ static void publish_events_work(struct k_work *work) {
     }
 }
 
-
 // display listeners
 static int on_layer_state_changed(const zmk_event_t *eh) {
     current_layer_index = zmk_keymap_highest_layer_active();
-
-    k_work_submit(&send_display_state_work);
     return ZMK_EV_EVENT_BUBBLE;
 }
 
@@ -334,8 +324,6 @@ static int on_wpm_state_changed(const zmk_event_t *eh) {
     if (wpm_ev) {
         current_wpm = (wpm_ev->state > 255) ? 255 : (uint8_t)wpm_ev->state;
     }
-
-    k_work_submit(&send_display_state_work);
     return ZMK_EV_EVENT_BUBBLE;
 }
 

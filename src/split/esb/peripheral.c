@@ -35,7 +35,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
     ((sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta)) * \
      CONFIG_ZMK_SPLIT_ESB_EVENT_BUFFER_ITEMS)
 #define RX_BUFFER_SIZE                                                                             \
-    ((sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix)) *                      \
+    ((sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix)) * \
      CONFIG_ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS)
 
 RING_BUF_DECLARE(chosen_rx_buf, RX_BUFFER_SIZE);
@@ -69,10 +69,9 @@ static void begin_tx(void) {
     zmk_split_esb_async_tx(&async_state);
 }
 
-
 // new display logic
-static uint8_t display_layer_index = 0;
-static uint8_t display_wpm = 0;
+static volatile uint8_t display_layer_index = 0;
+static volatile uint8_t display_wpm = 0;
 
 uint8_t zmk_split_esb_display_get_layer(void) {
     return display_layer_index;
@@ -119,7 +118,6 @@ void zmk_split_esb_on_ptx_esb_callback(app_esb_event_t *event) {
     zmk_split_esb_cb(event, &async_state);
 }
 
-
 static ssize_t get_payload_data_size(const struct zmk_split_transport_peripheral_event *evt) {
     switch (evt->type) {
     case ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_INPUT_EVENT:
@@ -158,17 +156,12 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
         return data_size;
     }
 
-    // lock it for a safe result from ring_buf_space_get()
-    // NOTE: esb_send_evt_sem is safe:
-    // - Called from application thread, not ISR
-    // - begin_tx() releases semaphore before returning
     int ret = k_sem_take(&esb_send_evt_sem, K_FOREVER);
     if (ret) {
         LOG_WRN("Shouldn't be called FOREVER");
         return 0;
     }
 
-    // Data + type + source
     size_t payload_size =
         data_size + sizeof(peripheral_id) + sizeof(enum zmk_split_transport_peripheral_event_type);
 
@@ -190,9 +183,7 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
                                     }};
 
     size_t pfx_len = sizeof(env.prefix) + payload_size;
-    // LOG_HEXDUMP_DBG(&env, pfx_len, "Payload");
 
-    // lock IRQs so the ESB TX callback can't read a half-written message
     unsigned int irq_key = irq_lock();
 
     size_t put = ring_buf_put(&chosen_tx_buf, (uint8_t *)&env, pfx_len);
@@ -206,7 +197,6 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
     if (put != sizeof(postfix)) {
         LOG_WRN("Failed to put the postfix (%d vs %d)", put, sizeof(postfix));
     }
-    // LOG_HEXDUMP_DBG(&postfix, sizeof(postfix), "postfix");
 
     uint8_t max_retry = get_retry_count(event);
     if (++message_id == 0) {
@@ -218,7 +208,6 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
     if (put != sizeof(meta)) {
         LOG_WRN("Failed to put the meta (%d vs %d)", put, sizeof(meta));
     }
-    // LOG_HEXDUMP_DBG(&meta, sizeof(meta), "meta");
 
     irq_unlock(irq_key);
 
@@ -282,8 +271,6 @@ static int zmk_split_esb_peripheral_init(void) {
 
 SYS_INIT(zmk_split_esb_peripheral_init, APPLICATION, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
-
-// modified for display logic
 static void process_tx_cb(void) {
     while (ring_buf_size_get(&chosen_rx_buf) > ESB_MSG_EXTRA_SIZE) {
         struct esb_command_envelope env;
